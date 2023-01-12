@@ -1,0 +1,370 @@
+---
+title: "Machine Learning for synteny Based Chromosome Allocation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### MachineLearning
+to construct a machine learning algorithm, we first need some labeled data so that both the algorithm can learn from it (training data), and then we can assess the accuracy of the model (test data), so we need data labeling:
+   1 - No Allocation (NALL) Data:
+               * there are quite a bunch of contigs that we don't want to allocate a chromosomal location insufficient amount of information or conflicting information,
+               so, for all of them, we need to create mock data so that when the algorithm sees such a contig/data point, it knows it needs to allocate it "NALL", meaning 
+               no synteny based chromosomal allocation can be done to that contig, and classifies it as "NALL", therefore, we need to construct mock data points that we'll 
+               label as NALL due to differing conditions
+               * the contigs that need to be labeled as NALL can be the ones that should fail to succeed to have at least more than two orthologs on them, or fail to have 
+               a gene density higher than three in a million bases, or have similar amounts of ortholog values for at least two of the chromosomes so that which chromosome 
+               the synteny maps is indecisive, therefore, I labeled data points from Musca aabys orthologs and labeled them as NALL, which are as
+                    - 0 orthologs on a contig                                   --> so that OrthoCount<=2 | GeneDensity < 0.000003 would be labeled NALL 
+                    - 1 ortholog on a contig                                    --> so that OrthoCount<=2 | GeneDensity < 0.000003 would be labeled NALL 
+                    - 2 orthologs on a contig
+                         -- both mapping to same chr                            --> so that OrthoCount<=2 |& GeneDensity < 0.000003 would be labeled NALL 
+                         -- each mapping to diff chr                            --> so that OrthoCount<=2 |& GeneDensity < 0.000003 would be labeled NALL 
+                    - 3 orthologs on a contig
+                         -- but gene density not enough                         --> so that OrthoCount>2 but GeneDensity < 0.000003 would be labeled NALL 
+                         -- but mapping to diff chr                             --> so that OrthoCount>2 & GeneDensity >= 0.000003 still labeled NALL if map indecisive
+                    - many orthologs but mapping to diff chr in close values    --> so that OrthoCount>2 & GeneDensity >= 0.000003 still labeled NALL if map indecisive
+  
+   2 - Allocated Data (X,2L,2R,3L,3R,4,Y):
+               * I need to teach the algorithm to think like I would, so, we need to give it labeled data again but labeled with the correct chromosomal allocation this time,
+               for this, we again need different types of data to be labeled correctly and in a way that the algorithm can differentiate what contig would be labeled (NALL or 
+               not) and as which chromosome
+               * the contigs to be labeled will serve different purposes, which are as
+                   - 3 orthologs on a contig and eligible for classification        --> so that the algorithm can have an idea to differentiate between what to label NALL and not,
+                        -- all orthologs from same contig                           so that by labeling both NALLs (on previos step) and not NALLs with 3 orthologs, we'll supply it 
+                                                                                    with an idea of when it's ok to make a chromosome assumption and when it's ok to label NALL 
+                   - Location of known M. domestica aabys contigs                   --> the aabys contigs that the true chromosomal locations are known and published by J. Scott 
+                                                                                    will be labeled as their true chromosomes so that we have an idea of how the true parameters can
+                                                                                    be when the location is not synteny based but exact
+                   - Manual labeling of M.domestica aabys contigs                   --> the aabys contigs that were used to construct OrthoMCL based synteny mapping can be assessed 
+                                                                                    by their values and ideogram based plots on their chromosomal locations and labeled accordingly,
+                                                                                    as our data will also be M.domestica, the more data points the better, so we'll try to label as
+                                                                                    many as possible
+
+# Load Libraries
+```{r library}
+library(caret) 
+library(openxlsx)
+library(dplyr)
+```
+The caret package provides a consistent interface into hundreds of machine learning algorithms and provides useful convenience methods for data visualization, data resampling, model tuning and model comparison, among other features. It’s a must have tool for machine learning projects in R.
+
+# Get the Labeled Train & Test Data
+```{r data}
+# get the data
+aabysLabeledData <- read.xlsx("MachineLearning/LabeledData/aabys_contigs_labeled.xlsx", sheet = 1)
+aabysLabeledData <- mutate_at(aabysLabeledData, vars("contigOrthoCount>2", "geneDensity>=0.000003", "maxValue>=40%contigOrthoCount", "allocation"), as.factor)
+
+# construct train data
+trainData <- read.xlsx("MachineLearning/LabeledData/aabys_contigs_labeled.xlsx", sheet = 2)
+trainData <- mutate_at(trainData, vars("contigOrthoCount>2", "geneDensity>=0.000003", "maxValue>=40%contigOrthoCount", "allocation"), as.factor)
+
+# construct test data
+testData <- aabysLabeledData[which(!(aabysLabeledData$contig %in% trainData$contig)),]
+colnames(testData) <- make.names(colnames(testData))
+```
+we load the data and turn the character columns to factor columns for classifying over it, then, we load the train data we already set aside that would have data points from all possible classifications and events, then we get the test data that is everything except the training data; here, the most common way to define whether a data set is sufficient is to apply a 10 times rule. This rule means that the amount of input data (i.e., the number of examples) should be ten times more than the number of degrees of freedom a model has. Usually, degrees of freedom mean parameters in your data set. Here, to predict allocation, we'll use about 8-9 parameters, and there our train data is about 950 data points, hopefully enough
+
+# Exploratory Data Analysis
+```{r EDA}
+# dimensions of dataset
+dim(aabysLabeledData)
+
+# list types for each attribute
+sapply(aabysLabeledData, class)
+
+
+# list the levels for the class
+levels(aabysLabeledData$allocation)
+
+
+# summarize the class distribution
+percentage <- prop.table(table(aabysLabeledData$allocation)) * 100
+cbind(freq=table(aabysLabeledData$allocation), percentage=percentage)
+
+# visualize the relationships of attributes to each other
+plot(aabysLabeledData[,c(3,5,9:15)])
+
+# visualize the attributes of contigs
+par(mfrow=c(1,4))
+  for(i in 2:5) {
+  boxplot(aabysLabeledData[,i], main=names(aabysLabeledData)[i])
+  }
+
+# box and whisker plots for each attribute
+x <- aabysLabeledData[,c(3,9:15)]
+y <- aabysLabeledData[,16]
+
+featurePlot(x=x, y=y, plot = "box")
+```
+
+# Evaluate Some Algorithms, with Different Attributes
+in our data, some columns are repetitive like contigOrthoCount and contigOrthoCount>2, as one continuous one discrete variable indicating to a similar thing, we only want to use one of them to not have independent variables that are too linked to each other, therefore, we'll try with both ways, starting from fully continuous variables and compairing with discrete ones one by one, and then selecting the one with maximum accuracy
+
+Test Harness:
+    - cross validation: this will split our data set into 10 parts, train in 9 and test on 1 and release for all combinations of train-test splits
+    - we repeat the process 3 times for each algorithm with different splits of the data into 10 groups, in an effort to get a more accurate estimate
+    
+    - we are using the metric of “Accuracy” to evaluate models.
+    - accuracy = the ratio of the number of correctly predicted instances in divided by the total number of instances in the dataset as a percentage
+    - we will be using the metric variable when we run build and evaluate each model next.
+
+Build Models:
+    - we don’t know which algorithms would be good on this problem or what configurations to use
+    - we get an idea from the plots that some of the classes are partially linearly separable in some dimensions, so that's good.
+    
+    - we'll evaluate 5 different algorithms such that:
+          a) linear models           --> Linear Discriminant Analysis (LDA)
+          b) nonlinear models        --> Classification and Regression Trees (CART)
+                                     --> k-Nearest Neighbors (kNN)
+          c)complex nonlinear models --> Support Vector Machines (SVM) with a linear kernel
+                                     --> Random Forest (RF)
+                                     --> Learning Vector Quantization (LVQ)
+
+    - we reset the random number seed before reach run to ensure that the evaluation of each algorithm is performed using exactly the same data splits
+    - it ensures the results are directly comparable
+    
+    - we also have to use make.names otherwise the unusual column names like geneDensity>=0.000003 are not ok
+    
+Evaluate:
+    - accuracy: the ratio of the number of correctly predicted instances in divided by the total number of instances in the data set as a percentage
+              : there is a population of accuracy measures for each algorithm because each algorithm was evaluated 10 time
+              
+    - kappa: tells you how better your classifier is performing over the performance of a classifier that guesses at random according to the freq of each class
+
+
+
+1 - Full Continuous Variables
+```{r evaluate some algorithms}
+
+# Run algorithms using 10-fold cross validation
+control <- trainControl(method="repeatedcv", number=10, repeats = 3)
+metric <- "Accuracy"
+
+################################################################################
+
+# subset continuous predictors and the dependent variable
+trainFullC <- trainData[c("contigOrthoCount", "geneDensity", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+colnames(trainFullC) <- make.names(colnames(trainFullC))
+
+# build models
+set.seed(0)
+fit.lda <- train(allocation~., data=trainFullC, method="lda", metric=metric, trControl=control)
+
+set.seed(0)
+fit.cart <- train(allocation~., data=trainFullC, method="rpart", metric=metric, trControl=control)
+
+set.seed(0)
+fit.knn <- train(allocation~., data=trainFullC, method="knn", metric=metric, trControl=control)
+
+set.seed(0)
+fit.svm <- train(allocation~., data=trainFullC, method="svmRadial", metric=metric, trControl=control)
+
+set.seed(0)
+fit.rf <- train(allocation~., data=trainFullC, method="rf", metric=metric, trControl=control)
+
+set.seed(0)
+fit.lvq <- train(allocation~., data=trainFullC, method="lvq", metric=metric, trControl=control)
+
+# summarize accuracy of models
+results <- resamples(list(lda=fit.lda, cart=fit.cart, knn=fit.knn, svm=fit.svm, rf=fit.rf, lvq=fit.lvq))
+summary(results)
+
+# compare accuracy of models
+dotplot(results)
+
+# estimate variable importance
+importance <- varImp(fit.knn, scale=FALSE)
+plot(importance)
+importance <- varImp(fit.rf, scale=FALSE)
+plot(importance)
+
+################################################################################ 
+```
+nonlinear and complex linear models was more accurate compared to linear model, with sufficient accuracy and kappa, and, we focus on knn and rf as they seem to be the most successful ones and already eliminate lda which has a horrible fit. looking at variable importance for the two, we see that knn is somewhat unexpected between classes such that X is also being quite influenced by 2L for example, which is really not ideal and probably a batch effect, but, looking over to rf variable importances it seems like more as we want, so our favorite becomes rf for now. to see how the algorithms may change, we'll try with discrete variables too, substituting or adding to the continuous ones. 
+
+
+2 - Some Continuous Variables
+```{r evaluate some algorithms}
+
+# Run algorithms using 10-fold cross validation
+control <- trainControl(method="repeatedcv", number=10, repeats = 3)
+metric <- "Accuracy"
+
+################################################################################
+
+# subset predictors and the dependent variable
+trainFullC <- trainData[c("contigOrthoCount", "geneDensity>=0.000003", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+colnames(trainFullC) <- make.names(colnames(trainFullC))
+
+# build models
+
+set.seed(0)
+fit.cart <- train(allocation~., data=trainFullC, method="rpart", metric=metric, trControl=control)
+
+set.seed(0)
+fit.knn <- train(allocation~., data=trainFullC, method="knn", metric=metric, trControl=control)
+
+set.seed(0)
+fit.svm <- train(allocation~., data=trainFullC, method="svmRadial", metric=metric, trControl=control)
+
+set.seed(0)
+fit.rf <- train(allocation~., data=trainFullC, method="rf", metric=metric, trControl=control)
+
+set.seed(0)
+fit.lvq <- train(allocation~., data=trainFullC, method="lvq", metric=metric, trControl=control)
+
+# summarize accuracy of models
+results <- resamples(list(cart=fit.cart, knn=fit.knn, svm=fit.svm, rf=fit.rf, lvq=fit.lvq))
+summary(results)
+
+# compare accuracy of models
+dotplot(results)
+
+# estimate variable importance
+importance <- varImp(fit.rf, scale=FALSE)
+plot(importance)
+
+################################################################################ 
+```
+it seems that this model where gene density is now a discrete variable rather than continuous has quite a high accuracy and a kappa value for the best fitting model that is rf, as also the importance of variables seems logical, we choose this as our best model, and we'll use random forest as our model
+
+```{r method of choice random forest}
+print(fit.rf)
+```
+
+Selected Model: Random Forest
+now that we selected random forest as our machine learning algorithm, we will tune the algorithm now in a way that we'll be tuning two parameters, namely the mtry and the ntree parameters in where these two are perhaps the most likely to have the biggest effect on our final accuracy and kappa for rf
+  - mtry: Number of variables randomly sampled as candidates at each split (number of random variables used in each tree)
+  - ntree: Number of trees to grow (number of trees used in the forest)
+  
+  - since mtry was checked as 2,5,9 already by rf and 2 was selected by rf due to having the highest accuracy, we mingle with ntree; here, 
+  our approach is to create many caret models for our algorithm and pass in a different parameters directly to the algorithm manually such
+  that we'll evaluate different values for ntree while holding mtry constant
+```{r fine tune random forest}
+
+# Run algorithms using 10-fold cross validation
+control <- trainControl(method="repeatedcv", number=10, repeats = 3)
+metric <- "Accuracy"
+
+################################################################################
+
+# subset predictors and the dependent variable
+trainFullC <- trainData[c("contigOrthoCount", "geneDensity>=0.000003", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+colnames(trainFullC) <- make.names(colnames(trainFullC))
+
+################################################################################
+
+# evaluate different values for ntree while holding mtry constant
+tunegrid <- expand.grid(.mtry=2)
+
+modelList <- list()
+for (ntree in c(500, 1000, 1500, 2000, 2500)) {
+  
+	set.seed(0)
+	fit <- train(allocation~., data=trainFullC, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control, ntree=ntree)
+
+	key <- toString(ntree)
+	modelList[[key]] <- fit
+}
+
+# compare results
+results <- resamples(modelList)
+summary(results)
+dotplot(results)
+
+```
+all ntree values are quite close to each other with same min and max values, but as the mean kappa of ntree=2000 model is higher than the others even though slightly, we decide to continue with an rf model with mtry=2 and ntree=2000
+
+```{r method of choice random forest tuned}
+
+# Run algorithms using 10-fold cross validation
+control <- trainControl(method="repeatedcv", number=10, repeats = 3)
+metric <- "Accuracy"
+
+# subset predictors and the dependent variable
+trainFullC <- trainData[c("contigOrthoCount", "geneDensity>=0.000003", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+colnames(trainFullC) <- make.names(colnames(trainFullC))
+
+# fit the final model
+tunegrid <- expand.grid(.mtry=2)
+
+set.seed(0)
+fit.rf <- train(allocation~., data=trainFullC, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control, ntree=2000)
+
+print(fit.rf)
+```
+
+# Check on Test Data
+RF with mtry=2 and ntree=1000 was the most accurate model and now we want to get an idea of the accuracy of the model on our validation set. this will give us an independent final check on the accuracy of the best model. the validation set check is important in case you made a slip during such as overfitting to the training set or a data leak, the accuracy is actually tested here in a way
+```{r validation}
+
+# estimate skill of RF on the validation dataset
+predictions <- predict(fit.rf, testData)
+confusionMatrix(predictions, testData$allocation)
+```
+
+# Predict
+now that the machine learning algorithm is established with the labeled aabys data, we can do the actual prediction on MIII/MV/MI data sets, which were first aligned with known transcripts of aabys, untangled from the paralogs, constructed the coordinate of OrthoMCL database orthologs with Dmel, constructed the syntheny maps, and then got mathematically prepared by contig for machinelearning prediction; which now we only predict and record the predictions
+```{r prediction}
+
+# load the data for prediction, subset predictors, turn discrete variables to factors, correct the column names
+MIIIDataF <- read.xlsx("MachineLearning/PredictedData/MIII_contigs_predicted.xlsx")
+MVDataF   <- read.xlsx("MachineLearning/PredictedData/MV_contigs_predicted.xlsx")
+MIDataF   <- read.xlsx("MachineLearning/PredictedData/MI_contigs_predicted.xlsx")
+
+MIIIData <- MIIIDataF[c("contigOrthoCount", "geneDensity>=0.000003", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+MVData   <- MVDataF[c("contigOrthoCount", "geneDensity>=0.000003", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+MIData   <- MIDataF[c("contigOrthoCount", "geneDensity>=0.000003", "X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")]
+
+MIIIData <- mutate_at(MIIIData, vars("geneDensity>=0.000003", "allocation"), as.factor)
+MVData   <- mutate_at(MVData, vars("geneDensity>=0.000003", "allocation"), as.factor)
+MIData   <- mutate_at(MIData, vars("geneDensity>=0.000003", "allocation"), as.factor)
+
+colnames(MIIIData) <- make.names(colnames(MIIIData))
+colnames(MVData)   <- make.names(colnames(MVData))
+colnames(MIData)   <- make.names(colnames(MIData))
+
+################################################################################
+
+# predict the allocation by of RF on the prediction data sets
+MIIIDataF$allocation <- predict(fit.rf, MIIIData)
+MVDataF$allocation   <- predict(fit.rf, MVData)
+MIDataF$allocation   <- predict(fit.rf, MIData)
+
+write.xlsx(x = MIIIDataF, file = "MachineLearning/PredictedData/MIII_contigs_predicted.xlsx", col.names = TRUE)
+write.xlsx(x = MVDataF, file = "MachineLearning/PredictedData/MV_contigs_predicted.xlsx", col.names = TRUE)
+write.xlsx(x = MIDataF, file = "MachineLearning/PredictedData/MI_contigs_predicted.xlsx", col.names = TRUE)
+
+```
+
+
+# Assessing the Prediction
+the prediction and the labeling were then assessed by checking the genes with known chromosomal locations and assesing if the prediction/labeling indicates that chromosome too, so for this, both some phenotypic markers that are known to segregate with a certain chromosome and some other location-known genes were used, and here the genes:
+  - brown body, bwb                   --> phenotypic marker gene, inherited with chr 3, labeled X (https://doi.org/10.1038/s41598-017-04686-6)
+  - CYP6D1 & CYP6D3                   --> P450 genes, linked to chr 1, predicted 2L (MDOA002283 & MDOA002847, 10.1046/j.1365-2583.2001.00256.x)
+  - Scaffold NW_004765160 or KB855834 --> published chr 1, labeled 2L (https://doi.org/10.1016/j.pestbp.2018.01.001)
+  - CYP4G2                            --> linked to chr 3, labeled X (https://doi.org/10.1303/aez.20.73)
+  
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
