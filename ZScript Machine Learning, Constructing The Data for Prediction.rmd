@@ -1,0 +1,142 @@
+---
+title: "Constructing the Data Frame for Machine Learning Algorithm Labeling / Training / Testing / Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Make The Data to Feed in the MachineLearning 
+to construct a machine learning algorithm that would make synteny based chromosome allocation, there are first some cutoffs that needs to be done:
+   1 - Confidence in Orthologs:
+           * there are some orthologous groups that are quite big, encompassing many many many genes, causing one gene to have 10,15,150 orthologs in 
+           the corresponding organism, therefore, when we look at orhology, we want to have more confidence in the genes with single orthologs then genes 
+           with many many orthologs, and therefore we'll make a normalization for this
+           * here, we'll look at how pronounced the orthologous groups are between our two organisms and normalize orthologous groups according to how pronounced
+           they are, because otherwise the really immensely common ones like duplications, translocations, paralogs; they would be all over the genome, causing a 
+           gene in this group to map anywhere, making it really hard to entangle synteny
+           * so what we'll do is, any ortholog will have a value that equals 1/entryCount, meaning that for example if a orthologous group is just linking two genes 
+           together, meaning it's constructing only one synteny entry, the value of it will be 1/1 = 1, which will be the highest value an ortho group can have, 
+           meaning we're the most confident in this ortholog; but, for example if an orthologous group is constructing 20 synteny entries between the two organisms,
+           it's value will be 1/20 = 0.05, meaning we're not confident in this ortholog at all, and that's why it's only contributing so little to where this contig
+           might be coming from based on synteny; at the end, for each contig, we'll count how many orhologs they have for each chromosome with their corresponding 
+           values, so that the total count per corresponding chromosome is normalized, (through variable = synthCount)
+  
+   2 - Confidence in Contigs:
+           * there might be some contigs with very few genes / orthologs on them, therefore, it wouldn't be healthy to make a chromosomal allocation for a contig
+           based on just a couple genes as it wouldn't be too informative, and the effect of luck could be greater than that of information, therefore, we'll make
+           contig cutoff based on gene density on a contig, (through variable = contigOrthoCount)
+           * here, we'll look at how many genes a contig has and how long it is, and we'll then allocate NALL to the contigs with low gene density which would be the
+           contigs that it wouldn't be healthy to allocate a chromosomal location due to low information of their synteny; so, we'll put a allocation cutoff of at 
+           least three orthologs / transcribed genes per million bases (3/1.000.000) of a gene density and at least more than 2 genes per contig
+           
+   3 - Confidence in Crowds: 
+           * it is also possible that for example a contig can have 64 orthology entries originating from it, but all of which are quite unspecific, and for instance 
+           the value for 3R might be higher than the others, let's say it's 4.5, by pure chance; here, think about another contig with 6 orthology entries originating 
+           from it, but this time they are sufficiently specific, and the value mapping to 3R is again higher than the others, let's say 4.5. In these two scenarios, 
+           only the latter one should be classified as mapping to 3R while the first one should fail to be classified, therefore, we need a normalization for the values
+           to indicate how many orthologs they are representing. therefore, we'll put a cutoff such that if the highest values chromosome is lower than 40% of the gene
+           count on a contig, we'll fail to classify that contig
+           * such that, thinking back to the example, if the contig with 64 entries has 32 genes of which 6 mapping to 3R, whereas the contig with 6 entries has 5 genes
+           mapping to 3R, here, only the latter will be classified and not the former. hopefully by this we'll not give way for chance events to cause false chromosomal
+           allocations
+           
+then we either use the data to manually label so that we can use as test or train data for machine learning, or, construct the data and purely use for prediction with machine learning
+
+```{r}
+library(openxlsx)
+```
+
+```{r}
+##############################################################################################################################################
+
+# load the syntheny mapping elements to construct your data frame needed for data labeling /machine learning prediction
+karyotype <- read.table("BUSCO/OrthoMCL/Karyotypes/MI_karyotype.txt", header = TRUE)
+coordinates <- read.csv("BUSCO/OrthoMCL/Coordinates/MI_coordinates.txt",header= FALSE, sep = "\t")
+syntheny <- na.omit(read.table("BUSCO/OrthoMCL/SynthenyMaps/Dmel_vs_MI/Dmel_MI_sinteny.txt", header = TRUE, skipNul = TRUE, fill = TRUE))
+
+# merge the orthology group name with how many syntheny connections it constructs between your two organisms, keep that info at syntheny variable
+freqtable <- data.frame(table(syntheny$Ortho))
+colnames(freqtable) <- c("Ortho", "Freq") 
+syntheny <- merge(syntheny,freqtable,by = "Ortho")
+
+##############################################################################################################################################
+
+# construct an empty data rame with all the columns you'll need for your data
+df <- data.frame(matrix(data = 0, nrow = length(karyotype$Chr), ncol = 16))
+
+colnames(df) <- c("contig", "synthCount", "contigOrthoCount", "contigLength", "geneDensity", "contigOrthoCount>2", 
+                  "geneDensity>=0.000003", "maxValue>=40%contigOrthoCount","X", "2L", "2R", "3L", "3R", "4", "Y", "allocation")
+
+##############################################################################################################################################
+
+# get your data into the empty data frame
+df$contig <- karyotype$Chr                                                                              # contig 
+df$contigLength <- karyotype$End                                                                        # contigLength
+
+for (i in 1:length(df$contig)){                                     
+  subsyntheny <- syntheny[which(syntheny$Species2 == df$contig[i]),]
+  
+  df$synthCount[i] <- nrow(subsyntheny)                                                                 # number of syntheny entry connections made from that contig
+  df$contigOrthoCount[i] <- nrow(unique(subsyntheny[,c("Species2","Start2","End2")]))                   # number of genes/ortholog on the contig
+  df$geneDensity[i] <- df$contigOrthoCount[i] / df$contigLength[i]                                      # gene density of the contig
+
+
+  df$X[i]          <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-X"),]$Freq)                  # X chromosome value for the contig
+  df$`2L`[i]       <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-2L"),]$Freq)                 # 2L chromosome value for the contig
+  df$`2R`[i]       <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-2R"),]$Freq)                 # 2R chromosome value for the contig
+  df$`3L`[i]       <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-3L"),]$Freq)                 # 3L chromosome value for the contig
+  df$`3R`[i]       <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-3R"),]$Freq)                 # 3R chromosome value for the contig 
+  df$`4`[i]        <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-4"),]$Freq)                  # 4 chromosome value for the contig 
+  df$Y[i]          <- sum(1/subsyntheny[which(subsyntheny$Species1 == "chr-Y"),]$Freq)                  # Y chromosome value for the contig 
+  
+  
+  if(df[i,]$contigOrthoCount > 2){                                                                      # number genes on contig > 2 or not
+    df[i,]$`contigOrthoCount>2` <- "YES"                                                                
+  }
+  if(df[i,]$contigOrthoCount <= 2){
+    df[i,]$`contigOrthoCount>2` <- "NO"
+  }
+  
+  if(df[i,]$geneDensity >= 3/1000000){                                                                  # gene density of cntig bigger than 3 in 1.000.000 or not
+  df[i,]$`geneDensity>=0.000003` <- "YES"
+  }
+  if(df[i,]$geneDensity < 3/1000000){
+  df[i,]$`geneDensity>=0.000003` <- "NO"
+  }
+  
+  maxValue <- max(c(df$X[i], df$`2L`[i], df$`2R`[i], df$`3L`[i], df$`3R`[i], df$`4`[i], df$Y[i]))       # highest value chr is more than 40% of gene count of contig or not
+  if(df[i,]$contigOrthoCount * 40/100 < maxValue){
+    df[i,]$`maxValue>=40%contigOrthoCount` <- "YES"
+  }
+  if(df[i,]$contigOrthoCount * 40/100 >= maxValue){
+    df[i,]$`maxValue>=40%contigOrthoCount` <- "NO"
+  }
+} 
+
+write.xlsx(x = df, file = "MachineLearning/MI_contigs.xlsx", col.names = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
