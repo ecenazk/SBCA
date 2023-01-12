@@ -1,0 +1,91 @@
+---
+title: "Untangling The Paralogs and Duplications in Transcriptome Alignments to Contigs"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Transcriptome Alignments to Contigs
+whole Musca domestica aabys annotated transcripts in VectorBase aligned to MIII/MV/MI_aabys contigs through minimap2 aligner, which is splice aware. the transcripts retrieved from (https://vectorbase.org/vectorbase/app/downloads/Current_Release/Mdomesticaaabys/fasta/data/), and then subset so that we only have one transcript per gene, which is the longest one, ending up with 16135 unique transcripts in where we have one transcript per gene. from all the splice aware aligners that could have been used, minimap2 chosen so that the output can be in PAF format (Pairwise mApping Format) because this way PAF gives the exact coordinates of alignment on the reference, making it quite easy to extract the coordinates for future steps like syntheny mapping
+
+Usage:
+----> minimap2 -x splice -uf -C5 -t16 <refcontig.fa> <oneTranscriptPerGene.fa> -o <alignment.paf>
+          * -x splice is for long-read spliced alignment
+          * -u how to find canonical splicing sites GT-AG; -f: transcript strand
+          * -C cost for a non-canonical GT-AG splicing
+          * -t number of threads
+          * -o path to output PAF alignment
+
+```{r load PAF alignment}
+library(pafr)
+alignment <- data.frame(read_paf("Minimap2/PAFs/MI_fulltranscriptome_alignment.paf"))
+```
+
+
+# Untangling the Paralogs and Duplications
+looking at the alignments, one can realize that there are instances that one transcript aligns to multiple places. but the thing is, each transcript has an identifier like MDOA000001-RA where MDOA000001 defines the gene it belongs to and RA belongs to transcript variant transcribed from that gene. therefore, as each gene identifier is unique for aabys, we also expect them to be unique for other strains. but the paralogs can align to each other, therefore causing wrong annotations there. so basically, we want to keep paralogs from aligning to each other while still being able to keep the possible duplications, translocations, or haplotypes that might be possible in the strains we investigate compared to aabys
+
+for this, we'll assume that none of the transcripts would actually be overlapping as that wouldn't be optimal for the act of transcription which is already really not common in the genome, and, we'll only consider the alignment that aligns better to a place in case there are more than one gene mapping there by comparing a BLAST-like match identity we'll compute from the alignment for each transcript by constructing a ratio of number of matching bases in the mapping to query sequence length. BLAST-like match identity is also used as a general cutoff such that if the transcript is matching less than 0.75, we'll eliminate that match directly, which is an incredibly loose cutoff as the transcripts have a great evolutionary pressure on them against substitutions and in/dels, and so an actual match, where the transcript is actually being transcribed from that sequence should have way way better match, so we're just eliminating the really poor alignments that the transcript is most probably not being transcribed from that region
+```{r untangle}
+#######################blast-like match identity################################ 
+
+alignment$BLASTmatch <- alignment$nmatch/alignment$qlen            # calculate BLAST-like match identity
+
+par(mfrow = c(1,2))                                                # plot the BLAST-like match identity in your alignments to assess the cutoff
+plot(sort(alignment$BLASTmatch))                                    
+hist(sort(alignment$BLASTmatch))
+
+alignment <- alignment[which(alignment$BLASTmatch >= 0.75),]       # use the cutoff to only have the alignments that are at least with 0.75 BLAST
+
+#######################no overlap in transcription##############################
+
+alignmentNoP <- data.frame()
+
+for (contig in unique(alignment$tname)){                           # for each contig
+  subalignC <- alignment[which(alignment$tname == contig),]        # subset the alignments for that contig
+  
+  for (i in 1:nrow(subalignC)){                                    # for every alignment row per contig
+    s <- subalignC$tstart[i]                                       # look at tstart and tend
+    e <- subalignC$tend[i]                                         # subset the alignments that the location overlaps with that row
+    
+    subalignSE <- subalignC[which(subalignC$tstart %in% seq(s,e) | subalignC$tend %in% seq(s,e)),]
+    
+    if (nrow(subalignSE == 1)){                                    # if there is only one row, than no overlap, get the entry
+      entry <- subalignSE
+    }
+    if (nrow(subalignSE != 1)){                                    # if there is more rows, than overlap, get the one with highest BLAST, if..
+      entry <- subalignSE[which(subalignSE$BLASTmatch == max(subalignSE$BLASTmatch)),][1,]  # ..the BLAST is the same, get only one entry at random
+    }
+    
+    alignmentNoP <- rbind(alignmentNoP, entry)                     # those entries are the ones with no paralogs overlapping
+    alignmentNoP <- unique(alignmentNoP)                           # if for example two rows overlap but one with higher blast, they'll both produce
+                                                                   # the same entry, therefore needs to be unique so that we see each entry once
+  }
+}
+
+alignmentNoP                                                       # you have your alignments without paralogs / overlaps now
+```
+
+
+# Creating the Ortholog Coordinate File from the Untangled Alignment
+now that we know which transcript is on which contig, we can merge that information with which transcript/gene belongs to what orthologous group (OrthoMCL orthologous groups considered) in order to locate the orthologs on contigs, therefore creating the coordinate file which we need to create the syntheny map, and from there, to further construct the mathematical representation of syntheny per chromosome to feed into syntheny-based chromosome allocation algorithm for prediction
+```{r coordinate}
+##############################gene-to-ortholog##################################
+
+alignmentNoP$Gene.ID <- gsub("-.*","",alignmentNoP$qname)                                                     # transform transcript names to gene names
+orttab  <- read.csv("BUSCO/OrthoMCL/Input_TXTs/GenesByOrthologPattern_Dmel_Md.txt",header = T, sep = "\t")    # get the ortholog names of Md genes in table
+merged <- merge(alignmentNoP,orttab,by = "Gene.ID")                                                           # merge gene names with ortholog names
+
+##############################coordinate file###################################
+
+write.table(merged[c("Ortholog.Group","tname","tstart", "tend")], quote = FALSE, row.names = FALSE, 
+            sep = "\t", col.names = FALSE, file = "BUSCO/OrthoMCL/Coordinates/MI_coordinates.txt")
+```
+
+
+
+
+
+
